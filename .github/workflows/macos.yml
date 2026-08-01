@@ -4,78 +4,57 @@ on: push
 permissions:
   contents: read
 
-  jobs:
-    macOS-CI:
-        strategy:
-              matrix:
-                      glx_option: ['dri', 'xlib']
-                          runs-on: macos-latest
-                              env:
-                                    GALLIUM_DUMP_CPU: true
-                                          MESON_EXEC: /Users/runner/Library/Python/3.11/bin/meson
-                                              steps:
-                                                  - name: Checkout
-                                                        uses: actions/checkout@v3
-                                                            - name: Install Dependencies
-                                                                  run: |
-                                                                          cat > Brewfile <<EOL
-                                                                                  brew "bison"
-                                                                                          brew "expat"
-                                                                                                  brew "gettext"
-                                                                                                          brew "libx11"
-                                                                                                                  brew "libxcb"
-                                                                                                                          brew "libxdamage"
-                                                                                                                                  brew "libxext"
-                                                                                                                                          brew "molten-vk"
-                                                                                                                                                  brew "ninja"
-                                                                                                                                                          brew "pkg-config"
-                                                                                                                                                                  brew "python@3.10"
-                                                                                                                                                                          EOL
+jobs:
+  macOS-CI:
+    strategy:
+      matrix:
+        glx_option: ['dri', 'xlib']
+    runs-on: macos-latest
+    env:
+      GALLIUM_DUMP_CPU: true
+      MESON_EXEC: /Users/runner/Library/Python/3.11/bin/meson
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+    - name: Install Dependencies
+      run: |
+        cat > Brewfile <<EOL
+        brew "bison"
+        brew "expat"
+        brew "gettext"
+        brew "libx11"
+        brew "libxcb"
+        brew "libxdamage"
+        brew "libxext"
+        brew "molten-vk"
+        brew "ninja"
+        brew "pkg-config"
+        brew "python@3.10"
+        EOL
 
-                                                                                                                                                                                  brew update
-                                                                                                                                                                                          brew bundle --verbose
-                                                                                                                                                                                              - name: Setup Python venv and install build tools
-                                                                                                                                                                                                    shell: bash
-                                                                                                                                                                                                          run: |
-                                                                                                                                                                                                                  # 使用 Homebrew 的 python@3.10 创建 venv（workflow 已通过 Brewfile 安装 python@3.10）
-                                                                                                                                                                                                                          PYTHON="$(brew --prefix python@3.10)/bin/python3"
-                                                                                                                                                                                                                                  if [ ! -x "$PYTHON" ]; then
-                                                                                                                                                                                                                                            echo "Error: Homebrew python@3.10 not found at $PYTHON"
-                                                                                                                                                                                                                                                      exit 1
-                                                                                                                                                                                                                                                              fi
-
-                                                                                                                                                                                                                                                                      # 创建并激活 venv
-                                                                                                                                                                                                                                                                              $PYTHON -m venv .venv
-                                                                                                                                                                                                                                                                                      source .venv/bin/activate
-
-                                                                                                                                                                                                                                                                                              # 升级 pip 并安装需要的 Python 包（在 venv 内进行）
-                                                                                                                                                                                                                                                                                                      python -m pip install --upgrade pip setuptools wheel
-                                                                                                                                                                                                                                                                                                              python -m pip install mako meson
-
-                                                                                                                                                                                                                                                                                                                      # 将 venv 的 bin 加入到后续步骤的 PATH（持久化）
-                                                                                                                                                                                                                                                                                                                              echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
-
-                                                                                                                                                                                                                                                                                                                                      # 把 meson 的路径写到 MESON_EXEC 环境变量供后续步骤使用
-                                                                                                                                                                                                                                                                                                                                              echo "MESON_EXEC=$PWD/.venv/bin/meson" >> "$GITHUB_ENV"
-                                                                                                                                                                                                                                                                                                                                                  - name: Configure
-                                                                                                                                                                                                                                                                                                                                                        run: |
-                                                                                                                                                                                                                                                                                                                                                                cat > native_config <<EOL
-                                                                                                                                                                                                                                                                                                                                                                        [binaries]
-                                                                                                                                                                                                                                                                                                                                                                                llvm-config = '/usr/local/opt/llvm/bin/llvm-config'
-                                                                                                                                                                                                                                                                                                                                                                                        EOL
-                                                                                                                                                                                                                                                                                                                                                                                                $MESON_EXEC . build --native-file=native_config -Dmoltenvk-dir=$(brew --prefix molten-vk) -Dbuild-tests=true -Dosmesa=true -Dgallium-drivers=swrast,zink -Dglx=${{ matrix.glx_option }}
-                                                                                                                                                                                                                                                                                                                                                                                                    - name: Build
-                                                                                                                                                                                                                                                                                                                                                                                                          run: $MESON_EXEC compile -C build
-                                                                                                                                                                                                                                                                                                                                                                                                              - name: Test
-                                                                                                                                                                                                                                                                                                                                                                                                                    run: $MESON_EXEC test -C build --print-errorlogs
-                                                                                                                                                                                                                                                                                                                                                                                                                        - name: Install
-                                                                                                                                                                                                                                                                                                                                                                                                                              run: $MESON_EXEC install -C build --destdir $PWD/install
-                                                                                                                                                                                                                                                                                                                                                                                                                                  - name: 'Upload Artifact'
-                                                                                                                                                                                                                                                                                                                                                                                                                                        if: always()
-                                                                                                                                                                                                                                                                                                                                                                                                                                              uses: actions/upload-artifact@v4
-                                                                                                                                                                                                                                                                                                                                                                                                                                                    with:
-                                                                                                                                                                                                                                                                                                                                                                                                                                                            name: macos-${{ matrix.glx_option }}-result
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                    path: |
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                              build/meson-logs/
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        install/
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                retention-days: 5
+        brew update
+        brew bundle --verbose
+    - name: Install Mako and meson
+      run: pip3 install --user mako meson
+    - name: Configure
+      run: |
+        cat > native_config <<EOL
+        [binaries]
+        llvm-config = '/usr/local/opt/llvm/bin/llvm-config'
+        EOL
+        $MESON_EXEC . build --native-file=native_config -Dmoltenvk-dir=$(brew --prefix molten-vk) -Dbuild-tests=true -Dosmesa=true -Dgallium-drivers=swrast,zink -Dglx=${{ matrix.glx_option }}
+    - name: Build
+      run: $MESON_EXEC compile -C build
+    - name: Test
+      run: $MESON_EXEC test -C build --print-errorlogs
+    - name: Install
+      run: $MESON_EXEC install -C build --destdir $PWD/install
+    - name: 'Upload Artifact'
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: macos-${{ matrix.glx_option }}-result
+        path: |
+          build/meson-logs/
+          install/
+        retention-days: 5
