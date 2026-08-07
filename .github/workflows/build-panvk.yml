@@ -1,0 +1,67 @@
+name: Build PanVK Driver
+
+on:
+  workflow_dispatch:  # 支持手动触发
+  schedule:
+    - cron: '0 6 * * *'  # 可选：每天北京时间下午2点自动构建
+
+jobs:
+  build-panvk:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [arm64, armhf] # 指定目标架构
+
+    steps:
+      - name: Checkout Mesa source code
+        uses: actions/checkout@v4
+        with:
+          repository: 'mesa3d/mesa' # 官方Mesa仓库
+          # ref: 'main'  # 可指定特定分支或tag
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson ninja-build python3-pip python3-setuptools \
+            pkg-config libwayland-dev libx11-dev libxext-dev \
+            libxdamage-dev libxfixes-dev libxcb-glx0-dev \
+            libxcb-shm0-dev libxxf86vm-dev libdrm-dev \
+            git build-essential bison flex libglvnd-dev \
+            crossbuild-essential-arm64 crossbuild-essential-armhf # 交叉编译工具链
+
+      - name: Setup cross compilation environment (if needed)
+        run: |
+          # 创建交叉编译文件，这里以 arm64 为例
+          cat > cross_file_arm64.txt << EOF
+          [binaries]
+          c = '/usr/bin/aarch64-linux-gnu-gcc'
+          cpp = '/usr/bin/aarch64-linux-gnu-g++'
+          ar = '/usr/bin/aarch64-linux-gnu-ar'
+          strip = '/usr/bin/aarch64-linux-gnu-strip'
+          pkgconfig = '/usr/bin/pkg-config'
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'aarch64'
+          cpu = 'armv8-a'
+          endian = 'little'
+          EOF
+
+      - name: Configure with Meson
+        run: |
+          meson setup build \
+            --cross-file cross_file_arm64.txt \ # 若需交叉编译则启用此行
+            -Dvulkan-drivers=panfrost \
+            -Dgallium-drivers=panfrost \
+            -Dplatforms=x11,wayland \
+            -Dbuildtype=release
+
+      - name: Compile the code
+        run: ninja -C build
+
+      - name: Upload PanVK driver artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: panvk-driver-${{ matrix.arch }}
+          path: build/src/vulkan/panfrost/libvulkan_panfrost.so
