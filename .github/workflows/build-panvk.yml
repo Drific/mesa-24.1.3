@@ -1,0 +1,298 @@
+name: Build PanVK Driver for Android (aarch64)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  NDK_VERSION: r27b
+  ANDROID_API: 28
+
+jobs:
+  build-panvk-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout Mesa source
+        uses: actions/checkout@v4
+
+      - name: Install host build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson \
+            ninja-build \
+            python3 \
+            python3-mako \
+            python3-yaml \
+            pkg-config \
+            glslang-tools \
+            bison \
+            flex \
+            wget \
+            unzip
+
+      - name: Cache Android NDK
+        uses: actions/cache@v4
+        id: ndk-cache
+        with:
+          path: android-ndk-${{ env.NDK_VERSION }}
+          key: android-ndk-${{ env.NDK_VERSION }}-linux-v1
+
+      - name: Download Android NDK
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-${{ env.NDK_VERSION }}-linux.zip \
+            -O ndk.zip
+          unzip -q ndk.zip
+          mv android-ndk-${{ env.NDK_VERSION }} android-ndk-${{ env.NDK_VERSION }}-extracted 2>/dev/null || true
+          if [ -d android-ndk-${{ env.NDK_VERSION }}-extracted ]; then
+            mv android-ndk-${{ env.NDK_VERSION }}-extracted android-ndk-${{ env.NDK_VERSION }}
+          fi
+          rm -f ndk.zip
+
+      - name: Set NDK environment variables
+        run: |
+          NDK_HOME="$PWD/android-ndk-${{ env.NDK_VERSION }}"
+          TOOLCHAIN="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "ANDROID_NDK=${NDK_HOME}" >> $GITHUB_ENV
+          echo "ANDROID_TOOLCHAIN=${TOOLCHAIN}" >> $GITHUB_ENV
+          echo "${TOOLCHAIN}/bin" >> $GITHUB_PATH
+
+      # ---- 核心步骤：一次性生成所有 AOSP 桩头文件 ----
+      # NDK 不含 AOSP 框架层头文件 (cutils/log/android 等)，但 Mesa 检测到
+      # __ANDROID__ 后会尝试 include 它们。我们在 NDK sysroot 中放桩文件，
+      # 这样编译器默认搜索路径就能找到，不需要额外 -I。
+      - name: Generate AOSP stub headers in NDK sysroot
+        run: |
+          SYSROOT="${{ env.ANDROID_TOOLCHAIN }}/sysroot/usr/include"
+
+          # 自动扫描 Mesa 源码中所有 Android 条件下的 include
+          # 用 grep 找到所有 __ANDROID__ 代码块中的 #include
+          echo "=== Scanning Mesa source for Android-specific includes ==="
+          INCLUDES=$(cd "$GITHUB_WORKSPACE" && \
+            find src include -name '*.c' -o -name '*.h' | \
+            xargs grep -A5 '__ANDROID__' 2>/dev/null | \
+            grep '#include' | \
+            sed 's/.*#include [<"]$$.*$$[>"]/\1/' | \
+            sort -u)
+
+          echo "Found Android-specific includes:"
+          echo "$INCLUDES"
+          echo ""
+
+          # 为每个需要的头文件创建桩
+          while IFS= read -r header; do
+            [ -z "$header" ] && continue
+            HEADER_PATH="${SYSROOT}/${header}"
+            HEADER_DIR=$(dirname "$HEADER_PATH")
+
+            # 如果 NDK sysroot 中已有该文件，跳过（不覆盖）
+            if [ -f "$HEADER_PATH" ]; then
+              echo "SKIP (exists): $header"
+              continue
+            fi
+
+            mkdir -p "$HEADER_DIR"
+
+            # 根据文件名生成对应的桩内容
+            case "$header" in
+              cutils/trace.h)
+                cat > "$HEADER_PATH" <<'STUB'
+          #pragma once
+          #include <stdint.h>
+          #define ATRACE_TAG_NEVER    0ULL
+          #define ATRACE_TAG_GRAPHICS 1ULL
+          static inline void atrace_begin(uint64_t tag, const char* name) { (void)tag; (void)name; }
+          static inline void atrace_end(uint64_t tag) { (void)tag; }
+          static inline int atrace_is_tag_enabled(uint64_t tag) { (void)tag; return 0; }
+          STUB
+                ;;
+              cutils/properties.h)
+                cat > "$HEADER_PATH" <<'STUB'
+          #pragma once
+          #define PROPERTY_VALUE_MAX 92
+          typedef void (*property_func)(void);
+          static inline int property_get(const char* key, char* value, const char* default_value)
+          { (void)key; if (value && default_value) { int i=0; while(default_value[i]&&i<91){value[i]=default_value[i];i++;} value[i]=0; } return 0; }
+          static inline int property_set(const char* key, const char* value)
+          { (void)key; (void)value; return -1; }
+          STUB
+                ;;
+              log/log.h)
+                cat > "$HEADER_PATH" <<'STUB'
+          #pragma once
+          #include <stdarg.h>
+          typedef enum {
+            ANDROID_LOG_UNKNOWN = 0, ANDROID_LOG_DEFAULT, ANDROID_LOG_VERBOSE,
+            ANDROID_LOG_DEBUG, ANDROID_LOG_INFO, ANDROID_LOG_WARN,
+            ANDROID_LOG_ERROR, ANDROID_LOG_FATAL, ANDROID_LOG_SILENT
+          } android_LogPriority;
+          static inline int __android_log_print(int prio, const char* tag, const char* fmt, ...)
+          { (void)prio; (void)tag; (void)fmt; return 0; }
+          static inline int __android_log_vprint(int prio, const char* tag, const char* fmt, va_list ap)
+          { (void)prio; (void)tag; (void)fmt; (void)ap; return 0; }
+          static inline int __android_log_write(int prio, const char* tag, const char* text)
+          { (void)prio; (void)tag; (void)text; return 0; }
+          static inline void __android_log_assert(const char* cond, const char* tag, const char* fmt, ...)
+          { (void)cond; (void)tag; (void)fmt; }
+          STUB
+                ;;
+              android/sync.h)
+                cat > "$HEADER_PATH" <<'STUB'
+          #pragma once
+          static inline int sync_wait(int fd, int timeout) { (void)fd; (void)timeout; return -1; }
+          static inline int sync_merge(const char *name, int fd1, int fd2) { (void)name; (void)fd1; (void)fd2; return -1; }
+          STUB
+                ;;
+              android/hardware_buffer.h)
+                cat > "$HEADER_PATH" <<'STUB'
+          #pragma once
+          #include <stdint.h>
+          typedef struct AHardwareBuffer AHardwareBuffer;
+          typedef struct AHardwareBuffer_Desc { uint32_t width; uint32_t height; uint32_t layers; uint32_t format; uint32_t usage; } AHardwareBuffer_Desc;
+          static inline int AHardwareBuffer_allocate(const AHardwareBuffer_Desc* desc, AHardwareBuffer** outBuffer) { (void)desc; (void)outBuffer; return -1; }
+          static inline void AHardwareBuffer_release(AHardwareBuffer* buffer) { (void)buffer; }
+          static inline void AHardwareBuffer_describe(const AHardwareBuffer* buffer, AHardwareBuffer_Desc* desc) { (void)buffer; (void)desc; }
+          static inline int AHardwareBuffer_lock(AHardwareBuffer* buffer, uint64_t usage, int32_t fence, const void* rect, void** outVirtualAddress) { (void)buffer; (void)usage; (void)fence; (void)rect; (void)outVirtualAddress; return -1; }
+          static inline int AHardwareBuffer_unlock(AHardwareBuffer* buffer, int32_t* fence) { (void)buffer; (void)fence; return -1; }
+          STUB
+                ;;
+              android/hardware/gralloc.h|android/hardware/gralloc1.h)
+                cat > "$HEADER_PATH" <<'STUB'
+          #pragma once
+          STUB
+                ;;
+              *)
+                # 通用桩：创建空文件（只解决 include 找不到的问题）
+                echo "/* auto-generated stub */" > "$HEADER_PATH"
+                echo "#pragma once" >> "$HEADER_PATH"
+                echo "CREATE (generic): $header"
+                continue
+                ;;
+            esac
+            echo "CREATE: $header"
+          done <<< "$INCLUDES"
+
+          echo ""
+          echo "=== All stubs created ==="
+          find "${SYSROOT}/cutils" "${SYSROOT}/log" "${SYSROOT}/android" -type f 2>/dev/null || true
+
+      - name: Create Android NDK cross-compilation file
+        run: |
+          cat > /tmp/android-aarch64.txt <<EOF
+          [binaries]
+          c = '${{ env.ANDROID_TOOLCHAIN }}/bin/aarch64-linux-android${{ env.ANDROID_API }}-clang'
+          cpp = '${{ env.ANDROID_TOOLCHAIN }}/bin/aarch64-linux-android${{ env.ANDROID_API }}-clang++'
+          ar = '${{ env.ANDROID_TOOLCHAIN }}/bin/llvm-ar'
+          strip = '${{ env.ANDROID_TOOLCHAIN }}/bin/llvm-strip'
+          nm = '${{ env.ANDROID_TOOLCHAIN }}/bin/llvm-nm'
+          ranlib = '${{ env.ANDROID_TOOLCHAIN }}/bin/llvm-ranlib'
+          pkg-config = '/usr/bin/pkg-config'
+          pkgconfig = '/usr/bin/pkg-config'
+
+          [built-in options]
+          c_args = ['-ffunction-sections', '-fdata-sections', '-fno-strict-aliasing']
+          c_link_args = ['-Wl,--gc-sections', '-Wl,--no-undefined', '-lm', '-llog']
+          cpp_args = ['-ffunction-sections', '-fdata-sections', '-fno-strict-aliasing']
+          cpp_link_args = ['-Wl,--gc-sections', '-Wl,--no-undefined', '-lm', '-llog']
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          EOF
+
+      - name: Build libdrm for Android (static)
+        run: |
+          git clone --depth=1 --branch=libdrm-2.4.122 \
+            https://gitlab.freedesktop.org/mesa/drm.git /tmp/libdrm-src
+          cd /tmp/libdrm-src
+          meson setup builddir \
+            --cross-file /tmp/android-aarch64.txt \
+            --prefix=/tmp/libdrm-install \
+            --libdir=lib \
+            --default-library=static \
+            -Dtests=false
+          ninja -C builddir -j$(nproc)
+          ninja -C builddir install
+          echo "=== libdrm installed ==="
+          find /tmp/libdrm-install -type f | sort
+
+      - name: Configure Mesa for Android
+        run: |
+          export PKG_CONFIG_PATH="/tmp/libdrm-install/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="/tmp/libdrm-install/lib/pkgconfig"
+          meson setup builddir/ \
+            --cross-file /tmp/android-aarch64.txt \
+            --prefix="${PWD}/builddir/install" \
+            --libdir=lib \
+            -Dbuildtype=release \
+            -Dvulkan-drivers=panfrost \
+            -Dgallium-drivers=[] \
+            -Dvulkan-layers=[] \
+            -Dtools=[] \
+            -Dplatforms=[] \
+            -Dvideo-codecs=[] \
+            -Dosmesa=false \
+            -Dllvm=disabled \
+            -Dglx=disabled \
+            -Degl=disabled \
+            -Dgbm=disabled \
+            -Dgles1=disabled \
+            -Dgles2=disabled \
+            -Dopengl=false \
+            -Dlibunwind=disabled \
+            -Dvalgrind=disabled \
+            -Dperfetto=false
+
+      - name: Generate git_sha1.h fallback
+        run: |
+          mkdir -p builddir/src
+          if [ ! -f builddir/src/git_sha1.h ]; then
+            echo '#define MESA_GIT_SHA1 "unknown"' > builddir/src/git_sha1.h
+          fi
+
+      - name: Build Mesa PanVK
+        run: ninja -C builddir/ -j$(nproc)
+
+      - name: Install to staging directory
+        run: ninja -C builddir/ install
+
+      - name: Verify build output
+        run: |
+          echo "=== .so files ==="
+          find builddir/install -name "*.so*" -type f | sort
+
+          SO_FILE=$(find builddir/install -name "libvulkan_panfrost.so" -type f | head -1)
+          if [ -n "$SO_FILE" ]; then
+            echo ""
+            echo "=== File info ==="
+            file "$SO_FILE"
+            echo ""
+            echo "=== ELF header ==="
+            readelf -h "$SO_FILE" | grep -E "Class|Machine|OS/ABI"
+            echo ""
+            echo "=== Dynamic dependencies ==="
+            readelf -d "$SO_FILE" | grep NEEDED || true
+            echo ""
+            echo "=== Vulkan entry points ==="
+            readelf --dyn-syms "$SO_FILE" 2>/dev/null | grep -i "vk_icd\|vkGetInstanceProc\|vkGetDeviceProc" || true
+          else
+            echo "ERROR: libvulkan_panfrost.so not found!"
+            echo "=== All installed files ==="
+            find builddir/install -type f | sort
+          fi
+
+      - name: Upload PanVK Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: panvk-android-aarch64
+          path: builddir/install/
+          retention-days: 14
+          if-no-files-found: warn
