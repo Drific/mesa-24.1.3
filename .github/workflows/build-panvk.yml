@@ -1,0 +1,206 @@
+name: Build PanVK Driver for Android (aarch64)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  NDK_VERSION: r27b
+  ANDROID_API: 28
+
+jobs:
+  build-panvk-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout Mesa source
+        uses: actions/checkout@v4
+
+      - name: Install host build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson \
+            ninja-build \
+            python3 \
+            python3-mako \
+            python3-yaml \
+            pkg-config \
+            glslang-tools \
+            bison \
+            flex \
+            wget \
+            unzip
+
+      - name: Cache Android NDK
+        uses: actions/cache@v4
+        id: ndk-cache
+        with:
+          path: android-ndk-${{ env.NDK_VERSION }}
+          key: android-ndk-${{ env.NDK_VERSION }}-linux-v1
+
+      - name: Download Android NDK
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-${{ env.NDK_VERSION }}-linux.zip \
+            -O ndk.zip
+          unzip -q ndk.zip
+          mv android-ndk-${{ env.NDK_VERSION }} android-ndk-${{ env.NDK_VERSION }}-extracted 2>/dev/null || true
+          if [ -d android-ndk-${{ env.NDK_VERSION }}-extracted ]; then
+            mv android-ndk-${{ env.NDK_VERSION }}-extracted android-ndk-${{ env.NDK_VERSION }}
+          fi
+          rm -f ndk.zip
+
+      - name: Set NDK environment variables
+        run: |
+          NDK_HOME="$PWD/android-ndk-${{ env.NDK_VERSION }}"
+          TOOLCHAIN="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "ANDROID_NDK=${NDK_HOME}" >> $GITHUB_ENV
+          echo "ANDROID_TOOLCHAIN=${TOOLCHAIN}" >> $GITHUB_ENV
+          echo "${TOOLCHAIN}/bin" >> $GITHUB_PATH
+
+      # -U__ANDROID__ 让 Mesa 走 Linux 代码路径，跳过所有 AOSP 框架头文件
+      # 但 wsi_common_display.c 会使用 pthread_cancel（Bionic 不支持），
+      # 所以需要提供桩实现
+      - name: Create pthread_cancel stub library
+        run: |
+          mkdir -p "${PWD}/stubs"
+          cat > "${PWD}/stubs/pthread_cancel_stub.c" <<'EOF'
+          #include <pthread.h>
+          /* Bionic 不支持 pthread_cancel，提供空实现让链接通过 */
+          int pthread_cancel(pthread_t thread) { (void)thread; return 0; }
+          int pthread_setcanceltype(int type, int *oldtype) { (void)type; if (oldtype) *oldtype = 0; return 0; }
+          EOF
+
+          # 编译桩库
+          "${ANDROID_TOOLCHAIN}/bin/aarch64-linux-android${ANDROID_API}-clang" \
+            -c "${PWD}/stubs/pthread_cancel_stub.c" \
+            -o "${PWD}/stubs/pthread_cancel_stub.o" \
+            -fPIC
+
+          "${ANDROID_TOOLCHAIN}/bin/llvm-ar" rcs \
+            "${PWD}/stubs/libpthread_cancel_stub.a" \
+            "${PWD}/stubs/pthread_cancel_stub.o"
+
+          echo "=== Stub library created ==="
+          file "${PWD}/stubs/libpthread_cancel_stub.a"
+          "${ANDROID_TOOLCHAIN}/bin/llvm-nm" "${PWD}/stubs/libpthread_cancel_stub.a"
+
+      - name: Create Android NDK cross-compilation file
+        run: |
+          cat > /tmp/android-aarch64.txt <<EOF
+          [binaries]
+          c = '${{ env.ANDROID_TOOLCHAIN }}/bin/aarch64-linux-android${{ env.ANDROID_API }}-clang'
+          cpp = '${{ env.ANDROID_TOOLCHAIN }}/bin/aarch64-linux-android${{ env.ANDROID_API }}-clang++'
+          ar = '${{ env.ANDROID_TOOLCHAIN }}/bin/llvm-ar'
+          strip = '${{ env.ANDROID_TOOLCHAIN }}/bin/llvm-strip'
+          nm = '${{ env.ANDROID_TOOLCHAIN }}/bin/llvm-nm'
+          ranlib = '${{ env.ANDROID_TOOLCHAIN }}/bin/llvm-ranlib'
+          pkg-config = '/usr/bin/pkg-config'
+          pkgconfig = '/usr/bin/pkg-config'
+
+          [built-in options]
+          c_args = ['-U__ANDROID__', '-ffunction-sections', '-fdata-sections', '-fno-strict-aliasing']
+          c_link_args = ['-Wl,--gc-sections', '-Wl,--no-undefined', '-lm', '-llog', '${PWD}/stubs/libpthread_cancel_stub.a']
+          cpp_args = ['-U__ANDROID__', '-ffunction-sections', '-fdata-sections', '-fno-strict-aliasing']
+          cpp_link_args = ['-Wl,--gc-sections', '-Wl,--no-undefined', '-lm', '-llog', '${PWD}/stubs/libpthread_cancel_stub.a']
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          EOF
+
+      - name: Build libdrm for Android (static)
+        run: |
+          git clone --depth=1 --branch=libdrm-2.4.122 \
+            https://gitlab.freedesktop.org/mesa/drm.git /tmp/libdrm-src
+          cd /tmp/libdrm-src
+          meson setup builddir \
+            --cross-file /tmp/android-aarch64.txt \
+            --prefix=/tmp/libdrm-install \
+            --libdir=lib \
+            --default-library=static \
+            -Dtests=false
+          ninja -C builddir -j$(nproc)
+          ninja -C builddir install
+          echo "=== libdrm installed ==="
+          find /tmp/libdrm-install -type f | sort
+
+      - name: Configure Mesa for Android
+        run: |
+          export PKG_CONFIG_PATH="/tmp/libdrm-install/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="/tmp/libdrm-install/lib/pkgconfig"
+          meson setup builddir/ \
+            --cross-file /tmp/android-aarch64.txt \
+            --prefix="${PWD}/builddir/install" \
+            --libdir=lib \
+            -Dbuildtype=release \
+            -Dvulkan-drivers=panfrost \
+            -Dgallium-drivers=[] \
+            -Dvulkan-layers=[] \
+            -Dtools=[] \
+            -Dplatforms=[] \
+            -Dvideo-codecs=[] \
+            -Dosmesa=false \
+            -Dllvm=disabled \
+            -Dglx=disabled \
+            -Degl=disabled \
+            -Dgbm=disabled \
+            -Dgles1=disabled \
+            -Dgles2=disabled \
+            -Dopengl=false \
+            -Dlibunwind=disabled \
+            -Dvalgrind=disabled \
+            -Dperfetto=false
+
+      - name: Generate git_sha1.h fallback
+        run: |
+          mkdir -p builddir/src
+          if [ ! -f builddir/src/git_sha1.h ]; then
+            echo '#define MESA_GIT_SHA1 "unknown"' > builddir/src/git_sha1.h
+          fi
+
+      - name: Build Mesa PanVK
+        run: ninja -C builddir/ -j$(nproc)
+
+      - name: Install to staging directory
+        run: ninja -C builddir/ install
+
+      - name: Verify build output
+        run: |
+          echo "=== .so files ==="
+          find builddir/install -name "*.so*" -type f | sort
+
+          SO_FILE=$(find builddir/install -name "libvulkan_panfrost.so" -type f | head -1)
+          if [ -n "$SO_FILE" ]; then
+            echo ""
+            echo "=== File info ==="
+            file "$SO_FILE"
+            echo ""
+            echo "=== ELF header ==="
+            readelf -h "$SO_FILE" | grep -E "Class|Machine|OS/ABI"
+            echo ""
+            echo "=== Dynamic dependencies ==="
+            readelf -d "$SO_FILE" | grep NEEDED || true
+            echo ""
+            echo "=== Vulkan entry points ==="
+            readelf --dyn-syms "$SO_FILE" 2>/dev/null | grep -i "vk_icd\|vkGetInstanceProc\|vkGetDeviceProc" || true
+          else
+            echo "ERROR: libvulkan_panfrost.so not found!"
+            echo "=== All installed files ==="
+            find builddir/install -type f | sort
+          fi
+
+      - name: Upload PanVK Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: panvk-android-aarch64
+          path: builddir/install/
+          retention-days: 14
+          if-no-files-found: warn
