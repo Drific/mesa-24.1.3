@@ -1,0 +1,147 @@
+name: Build PanVK Driver (aarch64)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-panvk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Mesa source
+        uses: actions/checkout@v4
+
+      - name: Configure apt for arm64 cross-compilation
+        run: |
+          sudo dpkg --add-architecture arm64
+
+          sudo mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.bak
+          sudo mv /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
+
+          sudo tee /etc/apt/sources.list.d/amd64-only.sources > /dev/null <<'EOF'
+          Types: deb
+          URIs: http://azure.archive.ubuntu.com/ubuntu
+          Suites: noble noble-updates noble-backports
+          Components: main restricted universe multiverse
+          Architectures: amd64
+
+          Types: deb
+          URIs: http://security.ubuntu.com/ubuntu
+          Suites: noble-security
+          Components: main restricted universe multiverse
+          Architectures: amd64
+          EOF
+
+          sudo tee /etc/apt/sources.list.d/arm64-ports.sources > /dev/null <<'EOF'
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: noble noble-updates noble-security
+          Components: main restricted universe multiverse
+          Architectures: arm64
+          EOF
+
+          sudo apt-get update
+
+      - name: Install native build tools (amd64)
+        run: |
+          sudo apt-get install -y \
+            meson \
+            ninja-build \
+            python3 \
+            python3-mako \
+            python3-yaml \
+            pkg-config \
+            glslang-tools \
+            bison \
+            flex \
+            cmake
+
+      - name: Install cross-compilation toolchain + arm64 dev libraries
+        run: |
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            libdrm-dev:arm64 \
+            libelf-dev:arm64 \
+            zlib1g-dev:arm64 \
+            libexpat1-dev:arm64 \
+            libwayland-dev:arm64
+
+      # 关键：创建 pkg-config wrapper 脚本，为 arm64 设置正确的搜索路径
+      - name: Create arm64 pkg-config wrapper
+        run: |
+          sudo tee /usr/bin/aarch64-linux-gnu-pkg-config > /dev/null <<'WRAPPER'
+          #!/bin/sh
+          PKG_CONFIG_LIBDIR="/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" \
+          PKG_CONFIG_PATH="/usr/lib/aarch64-linux-gnu/pkgconfig" \
+          exec /usr/bin/pkg-config "$@"
+          WRAPPER
+          sudo chmod +x /usr/bin/aarch64-linux-gnu-pkg-config
+
+      - name: Create Meson cross-compilation file
+        run: |
+          cat > /tmp/panvk-aarch64-cross.txt <<'EOF'
+          [binaries]
+          c = '/usr/bin/aarch64-linux-gnu-gcc'
+          cpp = '/usr/bin/aarch64-linux-gnu-g++'
+          ar = '/usr/bin/aarch64-linux-gnu-gcc-ar'
+          strip = '/usr/bin/aarch64-linux-gnu-strip'
+          pkg-config = '/usr/bin/aarch64-linux-gnu-pkg-config'
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          EOF
+
+      - name: Configure build with Meson (cross aarch64)
+        run: |
+          meson setup builddir/ \
+            --cross-file /tmp/panvk-aarch64-cross.txt \
+            --prefix="${PWD}/builddir/install" \
+            -Dbuildtype=release \
+            -Dvulkan-drivers=panfrost \
+            -Dgallium-drivers=[] \
+            -Dvulkan-layers=[] \
+            -Dtools=[] \
+            -Dplatforms=wayland \
+            -Dvideo-codecs=[] \
+            -Dosmesa=false
+
+      - name: Build PanVK
+        run: ninja -C builddir/ -j$(nproc)
+
+      - name: Install to staging directory
+        run: ninja -C builddir/ install
+
+      - name: Verify build output
+        run: |
+          echo "=== .so files ==="
+          find builddir/install -name "*.so*" -type f | sort
+          echo ""
+          echo "=== ICD JSON manifests ==="
+          find builddir/install -name "*.json" -type f | sort
+          echo ""
+          echo "=== Architecture check ==="
+          SO_FILE=$(find builddir/install -name "libvulkan_panfrost.so" -type f | head -1)
+          if [ -n "$SO_FILE" ]; then
+            file "$SO_FILE"
+          else
+            echo "libvulkan_panfrost.so not found, listing all panfrost files:"
+            find builddir/install -name "*panfrost*" -type f
+          fi
+
+      - name: Upload PanVK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: panvk-driver-aarch64
+          path: builddir/install/
+          retention-days: 14
+          if-no-files-found: warn
