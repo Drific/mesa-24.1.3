@@ -1,0 +1,97 @@
+name: Verify Turnip Build
+
+on:
+  workflow_run:
+    workflows: ["Build Turnip Driver for Android (aarch64)"]
+    types: [completed]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.payload.workflow_run.id,
+            });
+            const artifact = artifacts.data.artifacts.find(a => a.name === 'turnip-android-aarch64');
+            if (!artifact) {
+              core.setFailed('Artifact turnip-android-aarch64 not found');
+              return;
+            }
+            const download = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: artifact.id,
+              archive_format: 'zip',
+            });
+            const fs = require('fs');
+            fs.writeFileSync('${{ github.workspace }}/artifact.zip', Buffer.from(download.data));
+      - run: unzip artifact.zip -d install/
+
+      - name: Check .so exists
+        run: |
+          SO=$(find install/ -name "libvulkan_freedreno.so" -type f | head -1)
+          if [ -z "$SO" ]; then
+            echo "FAIL: libvulkan_freedreno.so not found"
+            find install/ -type f
+            exit 1
+          fi
+          echo "OK: $SO"
+          file "$SO"
+
+      - name: Check ELF header
+        run: |
+          SO=$(find install/ -name "libvulkan_freedreno.so" -type f | head -1)
+          readelf -h "$SO" | grep -E "Class|Machine|OS/ABI"
+          readelf -h "$SO" | grep -q "aarch64" || { echo "FAIL: not aarch64"; exit 1; }
+          echo "OK: aarch64 ELF"
+
+      - name: Check Vulkan symbols
+        run: |
+          SO=$(find install/ -name "libvulkan_freedreno.so" -type f | head -1)
+          SYMS=$(readelf --dyn-syms "$SO" 2>/dev/null | grep -i "vk_icd\|vkGetInstanceProc\|vkGetDeviceProc" || true)
+          if [ -z "$SYMS" ]; then
+            echo "FAIL: no Vulkan ICD entry points"
+            exit 1
+          fi
+          echo "OK: Vulkan symbols found"
+          echo "$SYMS"
+
+      - name: Check dynamic dependencies
+        run: |
+          SO=$(find install/ -name "libvulkan_freedreno.so" -type f | head -1)
+          echo "=== NEEDED libraries ==="
+          readelf -d "$SO" | grep NEEDED
+          echo ""
+          if readelf -d "$SO" | grep -q "libLLVM"; then
+            echo "FAIL: linked against libLLVM (should be disabled)"
+            exit 1
+          fi
+          echo "OK: no LLVM dependency"
+
+      - name: Check ICD JSON
+        run: |
+          JSON=$(find install/ -name "freedreno_icd.*.json" -type f | head -1)
+          if [ -z "$JSON" ]; then
+            echo "FAIL: no freedreno ICD JSON"
+            find install/ -name "*.json" -type f
+            exit 1
+          fi
+          echo "=== ICD JSON ==="
+          cat "$JSON"
+          echo ""
+
+          LIB_PATH=$(python3 -c "import json; print(json.load(open('$JSON'))['ICD']['library_path'])" 2>/dev/null || true)
+          if [ -z "$LIB_PATH" ]; then
+            echo "FAIL: no library_path in ICD JSON"
+            exit 1
+          fi
+          echo "library_path = $LIB_PATH"
+          echo "OK: ICD JSON valid"
