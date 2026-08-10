@@ -1,0 +1,243 @@
+name: Build Mesa PanVK Driver (aarch64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      buildtype:
+        description: 'Build type (release/debugoptimized/debug/plain)'
+        required: false
+        default: 'release'
+      mesa_tag:
+        description: 'Mesa version tag (e.g. 24.1.3)'
+        required: false
+        default: '24.1.3'
+
+jobs:
+  build-panvk-aarch64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      BUILD_DIR: build-aarch64
+      INSTALL_DIR: ${{ github.workspace }}/install
+      CROSS_FILE: ${{ github.workspace }}/cross-aarch64.ini
+
+    steps:
+      # -------------------------------------------------------
+      # 1. 拉取源码（你的仓库中应包含 Mesa 24.1.3 源码）
+      #    若需从官方拉取指定 tag，可改用如下方式：
+      #    repository: mesa/mesa  ref: mesa-${{ inputs.mesa_tag }}
+      # -------------------------------------------------------
+      - name: Checkout Mesa source
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------------
+      # 2. 安装交叉编译工具链
+      #    文档 Cross-compilation 章节示例中使用的包：
+      #    aarch64-linux-gnu-gcc / g++ / gcc-ar / strip / pkg-config
+      # -------------------------------------------------------
+      - name: Install cross-compilation toolchain
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y \
+            crossbuild-essential-arm64 \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            pkg-config-aarch64-linux-gnu \
+            qemu-user-static
+
+      # -------------------------------------------------------
+      # 3. 安装 aarch64 交叉编译依赖
+      #    文档 Cross-compilation 章节指出：
+      #    "sudo apt-rdepends --build-depends --follow=DEPENDS mesa
+      #     provides a complete and up-to-date list of all build
+      #     dependencies. Append :i386 suffix (or your desired
+      #     architecture) to package names"
+      #
+      #    此处按文档建议对依赖包添加 :arm64 后缀安装
+      #
+      #    文档还指出：不需要为仅构建时使用的工具
+      #    (python3, bison, flex, bindgen...) 安装交叉版本
+      # -------------------------------------------------------
+      - name: Install native build tools (host-side)
+        run: |
+          sudo apt-get install -y \
+            meson \
+            ninja-build \
+            python3-pip \
+            python3-mako \
+            python3-pyyaml \
+            glslang-tools \
+            bison \
+            flex \
+            pkg-config \
+            ccache
+
+      - name: Install arm64 cross-compiled dependencies
+        run: |
+          sudo apt-get install -y \
+            libdrm-dev:arm64 \
+            libelf-dev:arm64 \
+            libwayland-dev:arm64 \
+            wayland-protocols:arm64 \
+            llvm-dev:arm64 \
+            libclang-dev:arm64 \
+            libclc-dev:arm64 \
+            libllvmspirvlib-dev:arm64 \
+            libx11-dev:arm64 \
+            libxext-dev:arm64 \
+            libxfixes-dev:arm64 \
+            libxcb-glx0-dev:arm64 \
+            libxcb-shm0-dev:arm64 \
+            libx11-xcb-dev:arm64 \
+            libxcb-dri2-0-dev:arm64 \
+            libxcb-dri3-dev:arm64 \
+            libxcb-present-dev:arm64 \
+            libxshmfence-dev:arm64 \
+            libxxf86vm-dev:arm64 \
+            libxrandr-dev:arm64 \
+            zlib1g-dev:arm64 \
+            libexpat1-dev:arm64 \
+            libunwind-dev:arm64 \
+            libzstd-dev:arm64
+
+      # -------------------------------------------------------
+      # 4. 验证 LLVM 相关包版本一致性
+      #    文档 Dependencies 章节要求：
+      #    "libclc, llvm, libllvmspirvlib, libclang must be
+      #     the same version"
+      # -------------------------------------------------------
+      - name: Verify LLVM package versions
+        run: |
+          echo "=== arm64 LLVM package versions ==="
+          dpkg -l | grep -E '(llvm|libclc|libclang|libllvmspirvlib).*arm64' | awk '{print $2, $3}'
+          echo "===================================="
+
+      # -------------------------------------------------------
+      # 5. 配置 ccache 加速
+      # -------------------------------------------------------
+      - name: Configure ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-panvk-aarch64-${{ github.sha }}
+          restore-keys: |
+            ccache-panvk-aarch64-
+
+      # -------------------------------------------------------
+      # 6. 生成交叉编译配置文件
+      #    严格按照文档 Cross-compilation 章节中
+      #    "64-bit build on ARM linux" 示例的格式
+      #
+      #    文档指出：pkg-config 使用
+      #    /usr/bin/aarch64-linux-gnu-pkg-config
+      #
+      #    exe_wrapper = qemu-aarch64-static
+      #    用于 Meson 运行需要的 host 侧测试/检查
+      # -------------------------------------------------------
+      - name: Generate Meson cross file
+        run: |
+          cat > "${{ env.CROSS_FILE }}" << 'EOF'
+          [binaries]
+          c = '/usr/bin/aarch64-linux-gnu-gcc'
+          cpp = '/usr/bin/aarch64-linux-gnu-g++'
+          ar = '/usr/bin/aarch64-linux-gnu-gcc-ar'
+          strip = '/usr/bin/aarch64-linux-gnu-strip'
+          pkg-config = '/usr/bin/aarch64-linux-gnu-pkg-config'
+          exe_wrapper = '/usr/bin/qemu-aarch64-static'
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+
+          [built-in options]
+          c_args = []
+          c_link_args = []
+          cpp_args = []
+          cpp_link_args = []
+          EOF
+
+          echo "=== Cross file contents ==="
+          cat "${{ env.CROSS_FILE }}"
+
+      # -------------------------------------------------------
+      # 7. 设置交叉编译的 PKG_CONFIG_PATH
+      #    文档 PKG_CONFIG_PATH 章节：
+      #    "This environment variable is used to control the
+      #     search path for pkg-config"
+      #    确保 pkg-config 能找到 arm64 的 .pc 文件
+      # -------------------------------------------------------
+      - name: Set cross PKG_CONFIG_PATH
+        run: |
+          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
+
+      # -------------------------------------------------------
+      # 8. 使用 Meson 配置构建目录
+      #    文档 Basic Usage 章节：meson setup build/
+      #    文档 Cross-compilation 章节：
+      #      meson setup builddir/ --cross-file cross-llvm.ini
+      #
+      #    文档 LLVM 章节还指出可用 native-file 指定
+      #    host 侧 llvm-config 路径，避免交叉编译时
+      #    Meson 错误地找到了 target 的 llvm-config
+      # -------------------------------------------------------
+      - name: Generate native file for host-side tools
+        run: |
+          cat > native-x86.ini << 'EOF'
+          [binaries]
+          llvm-config = '/usr/bin/llvm-config'
+          EOF
+
+      - name: Configure Mesa with Meson (cross aarch64)
+        run: |
+          meson setup ${{ env.BUILD_DIR }} \
+            --cross-file ${{ env.CROSS_FILE }} \
+            --native-file native-x86.ini \
+            -Dvulkan-drivers=panfrost \
+            -Dgallium-drivers=panfrost \
+            -Dbuildtype=${{ inputs.buildtype || 'release' }} \
+            -Db_ndebug=true \
+            -Dprefix=${{ env.INSTALL_DIR }}
+
+      # -------------------------------------------------------
+      # 9. 编译
+      #    文档 Basic Usage 章节: ninja -C build/
+      # -------------------------------------------------------
+      - name: Build Mesa (aarch64)
+        run: |
+          ninja -C ${{ env.BUILD_DIR }} -j$(nproc)
+
+      # -------------------------------------------------------
+      # 10. 安装到指定前缀目录
+      #     文档 Basic Usage: ninja -C build/ install
+      #     文档 Installation Location: --prefix= 可指定安装目录
+      # -------------------------------------------------------
+      - name: Install to prefix directory
+        run: |
+          ninja -C ${{ env.BUILD_DIR }} install
+
+      # -------------------------------------------------------
+      # 11. 验证产物架构并列出 PanVK 相关 .so
+      # -------------------------------------------------------
+      - name: Verify artifacts and list PanVK files
+        run: |
+          echo "=== PanVK / panfrost shared libraries ==="
+          find ${{ env.INSTALL_DIR }} -name "*.so*" -exec file {} \;
+          echo ""
+          echo "=== All .so files ==="
+          find ${{ env.INSTALL_DIR }} -name "*.so*" | sort
+          echo "=============================="
+
+      # -------------------------------------------------------
+      # 12. 上传构建产物
+      # -------------------------------------------------------
+      - name: Upload PanVK aarch64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-panvk-aarch64-${{ inputs.mesa_tag || '24.1.3' }}
+          path: ${{ env.INSTALL_DIR }}/
+          retention-days: 30
