@@ -38,7 +38,8 @@ jobs:
             wget \
             unzip \
             patchelf \
-            zip
+            zip \
+            libssl-dev
 
       - name: Cache Android NDK
         uses: actions/cache@v4
