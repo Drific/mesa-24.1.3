@@ -68,18 +68,18 @@ jobs:
           echo "ANDROID_TOOLCHAIN=${TOOLCHAIN}" >> $GITHUB_ENV
           echo "${TOOLCHAIN}/bin" >> $GITHUB_PATH
 
-      - name: Create cross-compilation files
+      - name: Create cross-compilation file
         run: |
           NDK="${{ env.ANDROID_TOOLCHAIN }}/bin"
           cat > /tmp/android-aarch64.txt <<EOF
           [binaries]
           ar = '${NDK}/llvm-ar'
-          c = '${NDK}/aarch64-linux-android${ANDROID_API}-clang'
-          cpp = '${NDK}/aarch64-linux-android${ANDROID_API}-clang++'
+          c = '${NDK}/aarch64-linux-android28-clang'
+          cpp = '${NDK}/aarch64-linux-android28-clang++'
           c_ld = '${NDK}/ld.lld'
           cpp_ld = '${NDK}/ld.lld'
           strip = '${NDK}/llvm-strip'
-          pkg-config = '/usr/bin/pkg-config'
+          pkg-config = ['env', 'PKG_CONFIG_LIBDIR=${{ env.ANDROID_TOOLCHAIN }}/pkg-config', '/usr/bin/pkg-config']
 
           [host_machine]
           system = 'android'
@@ -87,23 +87,7 @@ jobs:
           cpu = 'armv8'
           endian = 'little'
           EOF
-
-          cat > /tmp/native.txt <<EOF
-          [binaries]
-          c = 'clang'
-          cpp = 'clang++'
-          ar = 'llvm-ar'
-          strip = 'llvm-strip'
-          c_ld = 'ld.lld'
-          cpp_ld = 'ld.lld'
-
-          [host_machine]
-          system = 'linux'
-          cpu_family = 'x86_64'
-          cpu = 'x86_64'
-          endian = 'little'
-          EOF
-
+          
       - name: Configure Mesa
         run: |
           meson setup builddir/ \
